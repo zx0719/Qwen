@@ -221,7 +221,7 @@ def main():
     qwen_path = "/mnt/data/zhuxiang/Qwen/Qwen3-4B"
     remoteclip_ckpt = "/home/xingyueao/RemoteClip/chendelong/RemoteClip/RemoteCLIP-ViT-L-14.pt"
 
-    out_dir = "/mnt/data/zhuxiang/Qwen/Remote-Clip+Qwen/outputs/V1/stage1_rsicd_projector"
+    out_dir = "/mnt/data/zhuxiang/Qwen/Remote-Clip+Qwen/outputs/V2/stage1_rsicd_projector"
 
     model = Stage1ProjectorAlignModel(
         qwen_path=qwen_path,
@@ -231,15 +231,28 @@ def main():
         align_weight=1.0,
     )
 
-    dataset = RSICDStage1Dataset(
-        ann_path=ann_path,
-        images_dir=images_dir,
+    rsicd_dataset = RSICDStage1Dataset(
+    ann_path=ann_path,
+    images_dir=images_dir,
+    preprocess=model.vision_tower.preprocess,
+    tokenizer=model.tokenizer,
+    image_token="<image>",
+    max_length=256,
+)
+
+    aid_dataset = AIDStage1Dataset(
+        aid_root=aid_root,
         preprocess=model.vision_tower.preprocess,
         tokenizer=model.tokenizer,
         image_token="<image>",
         max_length=256,
     )
+
+    # 直接拼接：总体样本数 = RSICD + AID
+    dataset = ConcatDataset([rsicd_dataset, aid_dataset])
+
     collator = Stage1Collator(pad_token_id=model.tokenizer.pad_token_id)
+
 
     print("[Trainable params]")
     for n, p in model.named_parameters():
