@@ -87,41 +87,30 @@ def load_rsicd_items(ann_path: str, images_dir: str) -> List[Tuple[str, List[str
     return items
 
 
-class RSICDStage1DatasetPair(Dataset):
+class RSICDStage1Dataset(Dataset):
     """
-    把一图多句展平：每张图的每条 caption 都变成一条样本。
+    第一阶段：随机采样一条 caption 做监督。
     labels：prompt 部分 -100，只对 caption 计算 loss。
     """
     def __init__(self, ann_path: str, images_dir: str, preprocess, tokenizer,
-                 image_token: str = "<image>", max_length: int = 256):
+                 image_token: str = "<image>", max_length: int = 256, seed: int = 42):
         self.preprocess = preprocess
         self.tokenizer = tokenizer
         self.image_token = image_token
         self.max_length = max_length
+        random.seed(seed)
 
-        # 复用你现有 load_rsicd_items，但它返回 (img_path, [caps])
-        raw_items = load_rsicd_items(ann_path, images_dir)
-
-        # 展平
-        self.pairs = []
-        skipped = 0
-        for img_path, caps in raw_items:
-            if not caps:
-                skipped += 1
-                continue
-            for cap in caps:
-                self.pairs.append((img_path, cap))
-
-        print(f"[RSICD Pair] pairs={len(self.pairs)} (skipped no-caption images={skipped})")
+        self.items = load_rsicd_items(ann_path, images_dir)
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        img_path, cap = self.pairs[idx]
+        img_path, caps = self.items[idx]
+        cap = random.choice(caps)
 
         img = Image.open(img_path).convert("RGB")
-        pixel_values = self.preprocess(img)
+        pixel_values = self.preprocess(img)  # (3,224,224)
 
         prompt = f"Describe the remote sensing image: {self.image_token}\nCaption: "
         full_text = prompt + cap
@@ -142,7 +131,6 @@ class RSICDStage1DatasetPair(Dataset):
             "attention_mask": attention_mask,
             "labels": labels,
         }
-
 
 
 @dataclass

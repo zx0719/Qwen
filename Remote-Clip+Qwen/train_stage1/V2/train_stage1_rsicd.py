@@ -2,14 +2,18 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 import sys
 import swanlab
+from torch.utils.data import ConcatDataset
+from aid_stage1_dataset import AIDStage1Dataset
 from transformers import TrainerCallback
 
 sys.path.insert(0, "/home/xingyueao/RemoteClip")
 from RemoteVisionTower import RemoteVisionTower, TowerConfig
-from rsicd_dataset import RSICDStage1Dataset, Stage1Collator
+from rsicd_dataset import RSICDStage1DatasetPair as RSICDStage1Dataset, Stage1Collator
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -35,6 +39,16 @@ class SwanLabCallback(TrainerCallback):
             return
         step = int(state.global_step)
         # logs 里通常包含 loss/learning_rate/grad_norm/epoch 等
+        # 如果 callback 被赋予 model，并且 model 保存了最近 step 的子损失，则合并到上传的 logs
+        try:
+            if hasattr(self, 'model') and getattr(self.model, '_last_losses', None) is not None:
+                merged = dict(logs)
+                merged.update(self.model._last_losses)
+                self.run.log(merged, step=step)
+                return
+        except Exception:
+            pass
+
         self.run.log(logs, step=step)
 
     def on_train_end(self, args, state, control, **kwargs):
@@ -50,9 +64,13 @@ class Stage1ProjectorAlignModel(nn.Module):
         remoteclip_ckpt_path: str,
         image_token: str = "<image>",
         trust_remote_code: bool = False,
+        align_weight: float = 1.0,
+        align_temp: float = 0.07,
     ):
         super().__init__()
         self.image_token = image_token
+        self.align_weight = align_weight
+        self.align_temp = align_temp
 
         self.tokenizer = AutoTokenizer.from_pretrained(qwen_path, use_fast=True, trust_remote_code=trust_remote_code)
         if self.tokenizer.pad_token is None:
@@ -82,6 +100,9 @@ class Stage1ProjectorAlignModel(nn.Module):
         # 只训 projector
         for p in self.vision_tower.projector.parameters():
             p.requires_grad = True
+
+        # alignment loss settings (InfoNCE)
+        self.align_loss_fn = nn.CrossEntropyLoss()
 
     def _merge(self, input_ids, attention_mask, labels, vision_tokens):
         """
@@ -144,8 +165,52 @@ class Stage1ProjectorAlignModel(nn.Module):
 
     def forward(self, input_ids, attention_mask, labels, pixel_values, **kwargs):
         vision_tokens = self.vision_tower(pixel_values)  # (B,196,H)
+
+        # 1) 计算对比对齐损失（InfoNCE）
+        # caption centroid: 使用 labels!=-100 的 token 的 embedding 均值
+        text_embeds = self.llm.get_input_embeddings()(input_ids)  # (B,T,D)
+        caption_mask = (labels != -100)  # (B,T)
+        caption_mask_f = caption_mask.unsqueeze(-1).to(dtype=text_embeds.dtype)
+        caption_sum = (text_embeds * caption_mask_f).sum(dim=1)  # (B,D)
+        caption_count = caption_mask.sum(dim=1).clamp(min=1).unsqueeze(-1).to(dtype=text_embeds.dtype)  # (B,1)
+        caption_centroid = caption_sum / caption_count  # (B,D)
+
+        vision_centroid = vision_tokens.mean(dim=1)  # (B,D)
+
+        # L2-normalize for cosine similarity
+        caption_norm = caption_centroid / (caption_centroid.norm(dim=1, keepdim=True).clamp(min=1e-6))
+        vision_norm = vision_centroid / (vision_centroid.norm(dim=1, keepdim=True).clamp(min=1e-6))
+
+        logits = torch.matmul(vision_norm, caption_norm.t()) / float(self.align_temp)  # (B,B)
+        labels_pos = torch.arange(logits.size(0), device=logits.device, dtype=torch.long)
+        # 对称 InfoNCE：image->text 和 text->image
+        i2t_loss = self.align_loss_fn(logits, labels_pos)
+        t2i_loss = self.align_loss_fn(logits.t(), labels_pos)
+        align_loss = 0.5 * (i2t_loss + t2i_loss)
+
+        # 2) 合并并计算语言建模损失
         inputs_embeds, attn, new_labels = self._merge(input_ids, attention_mask, labels, vision_tokens)
-        return self.llm(inputs_embeds=inputs_embeds, attention_mask=attn, labels=new_labels)
+        lm_outputs = self.llm(inputs_embeds=inputs_embeds, attention_mask=attn, labels=new_labels)
+
+        lm_loss = lm_outputs.loss if getattr(lm_outputs, "loss", None) is not None else None
+
+        if lm_loss is None:
+            total_loss = align_loss * self.align_weight
+        else:
+            total_loss = lm_loss + self.align_weight * align_loss
+
+        # 保存子损失用于 callback 上报
+        try:
+            self._last_losses = {
+                'lm_loss': float(lm_loss.detach().cpu()) if lm_loss is not None else None,
+                'align_loss': float(align_loss.detach().cpu()),
+                'total_loss': float(total_loss.detach().cpu()),
+            }
+        except Exception:
+            self._last_losses = None
+
+        lm_outputs.loss = total_loss
+        return lm_outputs
 
 
 def main():
@@ -153,28 +218,42 @@ def main():
     rsicd_root = "/mnt/data/xingyueao/BGM_IL/data/RSICD/RSICD"
     ann_path = os.path.join(rsicd_root, "dataset_rsicd.json")
     images_dir = os.path.join(rsicd_root, "RSICD_images")
-
+    aid_root = "/mnt/data/mm_data/AID/AID Data Set/AID/AID_dataset/AID"
     qwen_path = "/mnt/data/zhuxiang/Qwen/Qwen3-4B"
     remoteclip_ckpt = "/home/xingyueao/RemoteClip/chendelong/RemoteClip/RemoteCLIP-ViT-L-14.pt"
 
-    out_dir = "/mnt/data/zhuxiang/Qwen/Remote-Clip+Qwen/outputs/stage1_rsicd_projector"
+    out_dir = "/mnt/data/zhuxiang/Qwen/Remote-Clip+Qwen/outputs/V2/stage1_rsicd_projector"
 
     model = Stage1ProjectorAlignModel(
         qwen_path=qwen_path,
         remoteclip_ckpt_path=remoteclip_ckpt,
         image_token="<image>",
         trust_remote_code=False,
+        align_weight=1.0,
     )
 
-    dataset = RSICDStage1Dataset(
-        ann_path=ann_path,
-        images_dir=images_dir,
+    rsicd_dataset = RSICDStage1Dataset(
+    ann_path=ann_path,
+    images_dir=images_dir,
+    preprocess=model.vision_tower.preprocess,
+    tokenizer=model.tokenizer,
+    image_token="<image>",
+    max_length=256,
+)
+
+    aid_dataset = AIDStage1Dataset(
+        aid_root=aid_root,
         preprocess=model.vision_tower.preprocess,
         tokenizer=model.tokenizer,
         image_token="<image>",
         max_length=256,
     )
+
+    # 直接拼接：总体样本数 = RSICD + AID
+    dataset = ConcatDataset([rsicd_dataset, aid_dataset])
+
     collator = Stage1Collator(pad_token_id=model.tokenizer.pad_token_id)
+
 
     print("[Trainable params]")
     for n, p in model.named_parameters():
@@ -192,7 +271,7 @@ def main():
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
 
-        logging_steps=20,
+        logging_steps=1,
         save_strategy="no",
 
         bf16=True,
@@ -209,7 +288,7 @@ def main():
 
     swan_cb = SwanLabCallback(
         project="qwen3-remoteclip-stage1",
-        exp_name="rsicd_projector_align",
+        exp_name="rsicd_projector_align/loss1.0",
         config={
             "qwen_path": qwen_path,
             "remoteclip_ckpt": remoteclip_ckpt,
@@ -222,9 +301,14 @@ def main():
             "warmup_ratio": args.warmup_ratio,
             "max_length": 256,
             "image_tokens": 196,
-            "llm_hidden": int(model.llm.config.hidden_size),
+                "llm_hidden": int(model.llm.config.hidden_size),
+                "align_weight": float(model.align_weight),
+                "align_temp": float(model.align_temp),
         },
     )
+
+    # 让 callback 能访问 model 的 _last_losses
+    swan_cb.model = model
 
 
     trainer = Trainer(
