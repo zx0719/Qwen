@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 import sys
 import swanlab
+from torch.utils.data import ConcatDataset
+from aid_stage1_dataset import AIDStage1Dataset
 from transformers import TrainerCallback
 
 sys.path.insert(0, "/home/xingyueao/RemoteClip")
@@ -215,7 +217,7 @@ def main():
     rsicd_root = "/mnt/data/xingyueao/BGM_IL/data/RSICD/RSICD"
     ann_path = os.path.join(rsicd_root, "dataset_rsicd.json")
     images_dir = os.path.join(rsicd_root, "RSICD_images")
-
+    aid_root = "/mnt/data/mm_data/AID/AID Data Set/AID/AID_dataset/AID"
     qwen_path = "/mnt/data/zhuxiang/Qwen/Qwen3-4B"
     remoteclip_ckpt = "/home/xingyueao/RemoteClip/chendelong/RemoteClip/RemoteCLIP-ViT-L-14.pt"
 
